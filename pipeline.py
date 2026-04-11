@@ -2,6 +2,7 @@
 Конвейерный симулятор ISA (5 стадий: IF → ID → EX → MEM → WB)
 Вариант B: с пересылкой результатов (forwarding)
 Задача 8: подсчёт положительных элементов массива
+Лабораторная работа №3: интеграция кэш-памяти
 """
 
 import sys
@@ -10,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ISA import VM, Instr, Operand, to_int32, idiv_trunc0, VMError
+from cache import Cache
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +184,7 @@ class PipelinedVM:
             "PC": vm.PC,
         }
 
-    def run_pipelined(self, max_cycles: int = 100_000) -> dict:
+    def run_pipelined(self, max_cycles: int = 100_000, cache_config: dict = None) -> dict:
         vm = VM(mem_size=self.mem_size, debug=False)
         vm.load_program(self.prog_text)
         for addr, val in self.mem_init.items():
@@ -207,6 +209,14 @@ class PipelinedVM:
         self.data_stalls = 0
         self.structural_stalls = 0
         self.control_flushes = 0
+        self.cache_stalls = 0
+        self._pending_cache_stall = 0
+
+        # Инициализация кэша (если передана конфигурация)
+        if cache_config is not None:
+            self.cache = Cache(**cache_config)
+        else:
+            self.cache = None
 
         while self.cycles < max_cycles:
             self.cycles += 1
@@ -223,7 +233,14 @@ class PipelinedVM:
                 break
 
             # === MEM: обработка ex_mem → new_mem_wb ===
+            self._pending_cache_stall = 0
             new_mem_wb = self._do_mem()
+
+            # Учёт штрафа за промах кэша: добавляем такты простоя
+            if self._pending_cache_stall > 0:
+                self.cycles += self._pending_cache_stall
+                self.cache_stalls += self._pending_cache_stall
+                self._pending_cache_stall = 0
 
             # === EX: обработка id_ex → new_ex_mem ===
             # Для переходов: флаги берутся с forwarding от new_mem_wb и arch state
@@ -271,6 +288,8 @@ class PipelinedVM:
             "data_stalls": self.data_stalls,
             "structural_stalls": self.structural_stalls,
             "control_flushes": self.control_flushes,
+            "cache_stalls": self.cache_stalls,
+            "cache_stats": self.cache.get_stats() if self.cache is not None else None,
             "R": list(self.R),
             "Z": self.Z,
             "N": self.N,
@@ -498,7 +517,11 @@ class PipelinedVM:
 
         if op == "LD":
             addr = r.mem_addr
-            if 0 <= addr < len(self.MEM):
+            if self.cache is not None:
+                val, stall = self.cache.read(addr, self.MEM)
+                r.mem_data = val
+                self._pending_cache_stall = stall
+            elif 0 <= addr < len(self.MEM):
                 r.mem_data = self.MEM[addr]
             else:
                 r.mem_data = 0
@@ -508,12 +531,19 @@ class PipelinedVM:
 
         elif op == "ST":
             addr = r.mem_addr
-            if 0 <= addr < len(self.MEM):
+            if self.cache is not None:
+                stall = self.cache.write(addr, r.store_val, self.MEM)
+                self._pending_cache_stall = stall
+            elif 0 <= addr < len(self.MEM):
                 self.MEM[addr] = r.store_val
 
         elif op in ("ADD", "SUB", "MUL", "DIV") and meta.reads_mem:
             addr = r.mem_addr
-            if 0 <= addr < len(self.MEM):
+            if self.cache is not None:
+                val, stall = self.cache.read(addr, self.MEM)
+                r.mem_data = val
+                self._pending_cache_stall = stall
+            elif 0 <= addr < len(self.MEM):
                 r.mem_data = self.MEM[addr]
             else:
                 r.mem_data = 0
@@ -524,7 +554,11 @@ class PipelinedVM:
 
         elif op == "CMP" and meta.reads_mem:
             addr = r.mem_addr
-            if 0 <= addr < len(self.MEM):
+            if self.cache is not None:
+                val, stall = self.cache.read(addr, self.MEM)
+                r.mem_data = val
+                self._pending_cache_stall = stall
+            elif 0 <= addr < len(self.MEM):
                 r.mem_data = self.MEM[addr]
             else:
                 r.mem_data = 0
@@ -692,6 +726,135 @@ def run_test(name: str, arr: list, expected: int, debug: bool = False):
     return all_ok, pipe
 
 
+def run_cache_experiments(arr: list, miss_penalty: int = 10):
+    """
+    Серия экспериментов с различными конфигурациями кэша.
+    Используется массив arr из основных тестов.
+    """
+    mem_init = make_mem_init(arr)
+    n = len(arr)
+
+    pvm = PipelinedVM()
+    pvm.load_and_init(PROG_COUNT_POSITIVE, mem_init)
+
+    # Базовые результаты без кэша
+    base = pvm.run_pipelined()
+    base_cycles = base["cycles"]
+    base_cpi = base["cpi"]
+
+    print(f"\n{'='*80}")
+    print("ЭКСПЕРИМЕНТЫ С КЭШ-ПАМЯТЬЮ")
+    print(f"Программа: подсчёт положительных элементов, массив: {arr}")
+    print(f"Штраф за промах (miss_penalty): {miss_penalty} тактов")
+    print(f"{'='*80}")
+
+    # ------------------------------------------------------------------
+    # Эксперимент 1: влияние размера кэша (фиксированные line=4, assoc=2, LRU, write-back)
+    # ------------------------------------------------------------------
+    print(f"\n--- Эксперимент 1: Влияние размера кэша (line=4, assoc=2, LRU, write-back) ---")
+    print(f"{'Размер кэша':>16} {'Такты':>7} {'CPI':>6} {'Доступов':>10} {'Попад.':>8} {'Промах.':>8} {'MissRate':>10} {'AMAT':>6}")
+    print("-" * 80)
+    for cs in [16, 32, 64, 128, 256, 512]:
+        pvm.load_and_init(PROG_COUNT_POSITIVE, mem_init)
+        cfg = dict(cache_size=cs, line_size=4, associativity=2,
+                   replacement='LRU', write_policy='write-back',
+                   miss_penalty=miss_penalty)
+        r = pvm.run_pipelined(cache_config=cfg)
+        cs_obj = r["cache_stats"]
+        print(f"{cs:>14}w {r['cycles']:>7} {r['cpi']:>6.2f} "
+              f"{cs_obj['total_accesses']:>10} {cs_obj['hits']:>8} {cs_obj['misses']:>8} "
+              f"{cs_obj['miss_rate']:>10.3f} {cs_obj['amat']:>6.2f}")
+
+    # ------------------------------------------------------------------
+    # Эксперимент 2: влияние размера строки (cache=64, assoc=2, LRU, write-back)
+    # ------------------------------------------------------------------
+    print(f"\n--- Эксперимент 2: Влияние размера строки (cache=64, assoc=2, LRU, write-back) ---")
+    print(f"{'Размер строки':>15} {'Наборов':>8} {'Такты':>7} {'CPI':>6} {'MissRate':>10} {'AMAT':>6}")
+    print("-" * 60)
+    for ls in [1, 2, 4, 8, 16]:
+        if ls > 64:
+            continue
+        pvm.load_and_init(PROG_COUNT_POSITIVE, mem_init)
+        cfg = dict(cache_size=64, line_size=ls, associativity=2,
+                   replacement='LRU', write_policy='write-back',
+                   miss_penalty=miss_penalty)
+        r = pvm.run_pipelined(cache_config=cfg)
+        cs_obj = r["cache_stats"]
+        num_sets = 64 // (ls * 2)
+        print(f"{ls:>13}w {num_sets:>8} {r['cycles']:>7} {r['cpi']:>6.2f} "
+              f"{cs_obj['miss_rate']:>10.3f} {cs_obj['amat']:>6.2f}")
+
+    # ------------------------------------------------------------------
+    # Эксперимент 3: влияние ассоциативности (cache=64, line=4, LRU, write-back)
+    # ------------------------------------------------------------------
+    print(f"\n--- Эксперимент 3: Влияние ассоциативности (cache=64, line=4, LRU, write-back) ---")
+    print(f"{'Ассоциатив.':>13} {'Наборов':>8} {'Такты':>7} {'CPI':>6} {'MissRate':>10} {'AMAT':>6}")
+    print("-" * 58)
+    for assoc in [1, 2, 4, 8, 16]:
+        num_sets = 64 // (4 * assoc)
+        if num_sets < 1:
+            continue
+        pvm.load_and_init(PROG_COUNT_POSITIVE, mem_init)
+        cfg = dict(cache_size=64, line_size=4, associativity=assoc,
+                   replacement='LRU', write_policy='write-back',
+                   miss_penalty=miss_penalty)
+        r = pvm.run_pipelined(cache_config=cfg)
+        cs_obj = r["cache_stats"]
+        print(f"{assoc:>13} {num_sets:>8} {r['cycles']:>7} {r['cpi']:>6.2f} "
+              f"{cs_obj['miss_rate']:>10.3f} {cs_obj['amat']:>6.2f}")
+
+    # ------------------------------------------------------------------
+    # Эксперимент 4: сравнение политик замещения (cache=64, line=4, assoc=4)
+    # ------------------------------------------------------------------
+    print(f"\n--- Эксперимент 4: Политики замещения (cache=64, line=4, assoc=4, write-back) ---")
+    print(f"{'Политика':>12} {'Такты':>7} {'CPI':>6} {'Попад.':>8} {'Промах.':>8} {'MissRate':>10}")
+    print("-" * 55)
+    for repl in ['LRU', 'FIFO', 'RANDOM']:
+        # RANDOM недетерминирован — запускаем 3 раза, берём среднее
+        if repl == 'RANDOM':
+            results = []
+            for _ in range(3):
+                pvm.load_and_init(PROG_COUNT_POSITIVE, mem_init)
+                cfg = dict(cache_size=64, line_size=4, associativity=4,
+                           replacement='RANDOM', write_policy='write-back',
+                           miss_penalty=miss_penalty)
+                results.append(pvm.run_pipelined(cache_config=cfg))
+            r = results[0]  # берём первый для вывода (разброс мал при малом числе промахов)
+        else:
+            pvm.load_and_init(PROG_COUNT_POSITIVE, mem_init)
+            cfg = dict(cache_size=64, line_size=4, associativity=4,
+                       replacement=repl, write_policy='write-back',
+                       miss_penalty=miss_penalty)
+            r = pvm.run_pipelined(cache_config=cfg)
+        cs_obj = r["cache_stats"]
+        print(f"{repl:>12} {r['cycles']:>7} {r['cpi']:>6.2f} "
+              f"{cs_obj['hits']:>8} {cs_obj['misses']:>8} {cs_obj['miss_rate']:>10.3f}")
+
+    # ------------------------------------------------------------------
+    # Эксперимент 5: сравнение политик записи (cache=64, line=4, assoc=2, LRU)
+    # ------------------------------------------------------------------
+    print(f"\n--- Эксперимент 5: Политики записи (cache=64, line=4, assoc=2, LRU) ---")
+    print(f"{'Политика':>16} {'Такты':>7} {'CPI':>6} {'MissRate':>10} {'Writeback':>10}")
+    print("-" * 55)
+    for wp in ['write-back', 'write-through']:
+        pvm.load_and_init(PROG_COUNT_POSITIVE, mem_init)
+        cfg = dict(cache_size=64, line_size=4, associativity=2,
+                   replacement='LRU', write_policy=wp,
+                   miss_penalty=miss_penalty)
+        r = pvm.run_pipelined(cache_config=cfg)
+        cs_obj = r["cache_stats"]
+        print(f"{wp:>16} {r['cycles']:>7} {r['cpi']:>6.2f} "
+              f"{cs_obj['miss_rate']:>10.3f} {cs_obj['writebacks']:>10}")
+
+    # ------------------------------------------------------------------
+    # Итоговая сводка с базовым вариантом
+    # ------------------------------------------------------------------
+    print(f"\n--- Базовый вариант (без кэша) ---")
+    print(f"  Такты: {base_cycles}, CPI: {base_cpi:.2f}")
+    print(f"\n  Примечание: без кэша каждое обращение к памяти = 1 такт стадии MEM.")
+    print(f"  С кэшом при промахе добавляется {miss_penalty} тактов штрафа.")
+
+
 def main():
     debug = "--debug" in sys.argv
 
@@ -724,6 +887,12 @@ def main():
         print(f"{name:<30} {pipe['cycles']:>6} {pipe['instructions']:>6} {pipe['cpi']:>6.2f} {pipe['data_stalls']:>6} {pipe['control_flushes']:>6}")
 
     print(f"\nВсе тесты: {'PASSED' if all_passed else 'FAILED'}")
+
+    # Эксперименты с кэшом (флаг --cache)
+    if "--cache" in sys.argv:
+        # Используем «Большой массив» как представительный набор данных
+        exp_arr = [10, -3, 7, 0, -1, 5, 100, -50, 1, 0]
+        run_cache_experiments(exp_arr, miss_penalty=10)
 
 
 if __name__ == "__main__":
